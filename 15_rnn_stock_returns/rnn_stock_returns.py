@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+
+# load data
+df = pd.read_csv('sbux.csv')
+df['prevClose'] = df['close'].shift(1)
+df['return'] = (df['close'] - df['prevClose']) / df['prevClose']
+series = df['return'].values[1:].reshape(-1, 1)
+
+# normalize data
+scaler = StandardScaler()
+scaler.fit(series[: len(series) // 2])
+series = scaler.transform(series).flatten()
+
+# build dataset
+T = 20
+D = 1
+X = []
+Y = []
+for t in range(len(series) - T):
+    x = series[t: t + T]
+    X.append(x)
+    y = series[t + T]
+    Y.append(y)
+X = np.array(X).reshape(-1, T, 1)
+Y = np.array(Y).reshape(-1, 1)
+N = len(X)
+
+# autoregressive rnn model
+# enable gpu
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+
+# create model
+class RNN(nn.Module):
+    def __init__(self, n_inputs, n_hidden, n_rnnlayers, n_outputs):
+        super(RNN, self).__init__()
+        self.D = n_inputs
+        self.M = n_hidden
+        self.K = n_outputs
+        self.L = n_rnnlayers
+
+        self.rnn = nn.LSTM(
+            input_size=self.D,
+            hidden_size=self.M,
+            num_layers=self.L,
+            batch_first=True,
+        )
+        self.fc = nn.Linear(self.M, self.K)
+
+    def forward(self, X):
+        h0 = torch.zeros(self.L, X.size(0), self.M).to(device)
+        c0 = torch.zeros(self.L, X.size(0), self.M).to(device)
+
+        out, _ = self.rnn(X, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
+
+
+model = RNN(1, 5, 1, 1)
+model.to(device)
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# transform data
+X_train = torch.from_numpy(X[: -N // 2].astype(np.float32))
+Y_train = torch.from_numpy(Y[: -N // 2].astype(np.float32))
+X_test = torch.from_numpy(X[-N // 2:].astype(np.float32))
+Y_test = torch.from_numpy(Y[-N // 2:].astype(np.float32))
+
+X_train, Y_train = X_train.to(device), Y_train.to(device)
+X_test, Y_test = X_test.to(device), Y_test.to(device)
+
+# train model
+n_epochs = 200
+train_losses = np.zeros(n_epochs)
+test_losses = np.zeros(n_epochs)
+for it in range(n_epochs):
+    optimizer.zero_grad()
+    outputs = model(X_train)
+    loss = criterion(outputs, Y_train)
+    loss.backward()
+    optimizer.step()
+
+    train_losses[it] = loss.item()
+
+    test_outputs = model(X_test)
+    test_loss = criterion(test_outputs, Y_test)
+    test_losses[it] = test_loss.item()
+
+    if (it + 1) % 5 == 0:
+        print(f'Epoch: {it + 1}/{n_epochs}, Train Loss: {loss.item():.4f}, Test Loss: {test_loss.item():.4f}')
+
+# plot losses
+plt.figure()
+plt.plot(train_losses, label='train loss')
+plt.plot(test_losses, label='test loss')
+plt.legend()
+plt.show()
+
+# one-step forecast using true targets
+validation_target = Y[-N // 2:]
+validation_predictions = []
+i = 0
+while len(validation_predictions) < len(validation_target):
+    input_ = X_test[i].reshape(1, T, 1)
+    p = model(input_)
+    i += 1
+    validation_predictions.append(p[0, 0].item())
+
+plt.figure()
+plt.plot(validation_target, label='forecast target')
+plt.plot(validation_predictions, label='forecast prediction')
+plt.legend()
+plt.show()
+
+# multi-step forecast
+validation_target = Y[-N // 2:]
+validation_predictions = []
+last_x = X_test[0].view(T)
+while len(validation_predictions) < len(validation_target):
+    input_ = last_x.reshape(1, T, 1)
+    p = model(input_)
+    validation_predictions.append(p[0, 0].item())
+    last_x = torch.cat((last_x[1:], p[0]))
+
+plt.figure()
+plt.plot(validation_target, label='forecast target')
+plt.plot(validation_predictions, label='forecast prediction')
+plt.legend()
+plt.show()
